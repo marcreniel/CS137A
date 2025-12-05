@@ -55,13 +55,14 @@ class Frontier_Explorer(Node):
             half = window_size // 2
             padded = np.pad(mask, ((half, half), (half, half)), mode="constant")
             integral = padded.cumsum(axis=0).cumsum(axis=1)
+            # add leading zero row/col so we can use exclusive/inclusive indexing safely
+            integral = np.pad(integral, ((1, 0), (1, 0)), mode="constant")
             h, w = mask.shape
             k = window_size
-            # Compute sum over k x k neighborhoods centered on each original cell
-            y2 = np.arange(k, h + k)
-            x2 = np.arange(k, w + k)
-            y1 = y2 - k
-            x1 = x2 - k
+            y1 = np.arange(h)
+            y2 = y1 + k
+            x1 = np.arange(w)
+            x2 = x1 + k
             A = integral[np.ix_(y1, x1)]
             B = integral[np.ix_(y1, x2)]
             C = integral[np.ix_(y2, x1)]
