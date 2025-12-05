@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
 # Import ROS2 Python client library
+import time
+
+from typing import Optional
+
 import rclpy                    
 from rclpy.node import Node     # ROS2 node baseclass
 # Import navigation and math utilities from ASL TurtleBot3 library
@@ -22,12 +26,18 @@ import matplotlib.patches as patches
 # ---------------------------
 class AStar(object): 
 
-    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=0.1):
+    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=0.1,
+                 max_iterations: Optional[int] = None,
+                 max_runtime: Optional[float] = None,
+                 logger: Optional[object] = None):
         # Define search space bounds
-        self.statespace_lo = statespace_lo         # lower bound of state space (e.g., [-5, -5])
-        self.statespace_hi = statespace_hi         # upper bound of state space (e.g., [5, 5])
+        self.statespace_lo = np.array(statespace_lo, dtype=float)         # lower bound of state space (e.g., [-5, -5])
+        self.statespace_hi = np.array(statespace_hi, dtype=float)         # upper bound of state space (e.g., [5, 5])
         self.occupancy = occupancy                 # occupancy grid (typically DetOccupancyGrid2D)
         self.resolution = resolution               # grid resolution (meters per cell)
+        self.max_iterations = max_iterations
+        self.max_runtime = max_runtime
+        self.logger = logger
 
         # Reference offset for grid snapping
         self.x_offset = x_init                     
@@ -68,6 +78,12 @@ class AStar(object):
             self.resolution * round((x[1] - self.x_offset[1]) / self.resolution) + self.x_offset[1],
         )
 
+    def in_bounds(self, x):
+        return (
+            self.statespace_lo[0] <= x[0] <= self.statespace_hi[0]
+            and self.statespace_lo[1] <= x[1] <= self.statespace_hi[1]
+        )
+
     def get_neighbors(self, x):
         """Return all valid (free) neighboring cells of the current grid state."""
         neighbors = []
@@ -85,10 +101,18 @@ class AStar(object):
 
                 # Snap to grid to ensure discretization consistency
                 neighs = self.snap_to_grid((x_neigh,y_neigh))
-                # Only consider neighbor if it lies in free space
-                if self.is_free(neighs):
+                # Only consider neighbor if it lies inside the search bounds and free space
+                if self.in_bounds(neighs) and self.is_free(neighs):
                     neighbors.append(neighs)
         return neighbors
+
+    def _log(self, level: str, msg: str) -> None:
+        if self.logger is not None:
+            log_fn = getattr(self.logger, level, None)
+            if callable(log_fn):
+                log_fn(msg)
+                return
+        print(msg)
 
     def find_node_min_toal_cost(self):
         # TODO: Return the node in the open set with the lowest estimated total cost f(x).
@@ -114,9 +138,19 @@ class AStar(object):
 
     def solve(self):
         """Perform the A* search algorithm to find a path from start to goal."""
+        iterations = 0
+        start_time = time.monotonic()
         while len(self.open_set) > 0:
+            if self.max_iterations is not None and iterations >= self.max_iterations:
+                self._log("warn", f"A* aborted after {iterations} iterations (limit {self.max_iterations})")
+                return False
+            if self.max_runtime is not None and (time.monotonic() - start_time) >= self.max_runtime:
+                elapsed = time.monotonic() - start_time
+                self._log("warn", f"A* aborted after {elapsed:.2f}s (limit {self.max_runtime:.2f}s)")
+                return False
             # select node with minimum estimated total cost
             x_current = self.find_node_min_toal_cost()
+            iterations += 1
 
             # Check if the goal has been reached
             if x_current == self.x_goal:
@@ -153,7 +187,7 @@ class AStar(object):
 
         # If the open set is empty and goal not reached, no path exists
         return False
-        ########## Code ends here ##########
+    ########## Code ends here ##########
 
 
 # ---------------------------
@@ -182,6 +216,8 @@ class Navigator(BaseNavigator):
         self.coeffs = np.zeros(8)     # placeholder for spline coefficients
         self.v_desired = 0.15         # desired forward velocity (m/s)
         self.spline_alpha = 0.02      # smoothing factor for spline interpolation
+        self.declare_parameter("plan_timeout", 1.5)
+        self.declare_parameter("plan_max_iterations", 20000)
 
 
     def reset(self) -> None:
@@ -289,7 +325,19 @@ class Navigator(BaseNavigator):
         self.get_logger().info("Initialize A* planner")
 
         # Initialize A* planner
-        astar = AStar(statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution)
+        plan_timeout = float(self.get_parameter("plan_timeout").value)
+        plan_max_iterations = int(self.get_parameter("plan_max_iterations").value)
+        astar = AStar(
+            statespace_lo,
+            statespace_hi,
+            x_init,
+            x_goal,
+            occupancy,
+            resolution,
+            max_iterations=plan_max_iterations if plan_max_iterations > 0 else None,
+            max_runtime=plan_timeout if plan_timeout > 0.0 else None,
+            logger=self.get_logger(),
+        )
 
         # Execute A* search and handle failure
         if not astar.solve() or len(astar.path) < 4:
