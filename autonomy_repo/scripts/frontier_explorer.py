@@ -40,6 +40,9 @@ class Frontier_Explorer(Node):
             frontier_states (np.ndarray): state-vectors in (x, y) coordinates of potential states to explore. Shape is (N, 2), where N is the number of possible states to explore.
         """
         print("Running Explore\n")
+        if self.state is None or self.occupancy is None:
+            self.get_logger().warn("Explore called before state/map ready; skipping")
+            return
         window_size = 13    # defines the window side-length for neighborhood of cells to consider for heuristics
         current_state = np.array([self.state.x, self.state.y])
         
@@ -80,8 +83,10 @@ class Frontier_Explorer(Node):
             msg (Bool): updated nav_success message
         """
         # current_time = self.get_clock().now().nanoseconds/1e9
-        if self.active: 
+        if self.active and self.state is not None and self.occupancy is not None: 
             self.explore()
+        elif self.active:
+            self.get_logger().warn("nav_success received but state/map not ready yet")
         # else:           
         #     if (current_time-self.prev_time)<=5:
         #         pass
