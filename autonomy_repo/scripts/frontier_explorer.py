@@ -23,7 +23,6 @@ class Frontier_Explorer(Node):
         self.prev_time = 0
         self.current_time = 0
         self.declare_parameter("active", True)
-        self._delayed_timer = None
 
         self.state_sub = self.create_subscription(TurtleBotState, "/state", self.state_callback, 10)
         self.map_sub = self.create_subscription(OccupancyGrid, "/map", self.map_callback, 10)
@@ -146,17 +145,9 @@ class Frontier_Explorer(Node):
             probs=msg.data,
         )
         if self.map_flag==1 and self.state_flag==1:
-            print("Exploring (with delay)")
-            if self._delayed_timer is None:
-                self._delayed_timer = self.create_timer(3.0, self._delayed_explore_once)
+            print("Exploring")
+            self.explore()
             self.map_flag=0
-
-    def _delayed_explore_once(self):
-        # run explore once after initial delay, then cancel timer
-        if self._delayed_timer is not None:
-            self._delayed_timer.cancel()
-            self._delayed_timer = None
-        self.explore()
 
     @property  
     def active(self)-> bool:
