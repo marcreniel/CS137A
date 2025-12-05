@@ -90,6 +90,8 @@ class Frontier_Explorer(Node):
        
         msg = TurtleBotState()
         msg.x, msg.y = frontier_state
+        msg.theta = 0.0
+        self.get_logger().info(f"Publishing frontier goal to /cmd_nav: x={msg.x:.2f}, y={msg.y:.2f}")
         self.cmd_nav_pub.publish(msg)
 		
 
