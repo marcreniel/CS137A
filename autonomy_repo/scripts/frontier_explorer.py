@@ -1,254 +1,183 @@
 #!/usr/bin/env python3
-
-from __future__ import annotations
-
-import math
-from typing import Optional, Sequence, Tuple
+import rclpy                    # ROS2 client library
+from rclpy.node import Node     # ROS2 node baseclass
+from nav_msgs.msg import OccupancyGrid
+from asl_tb3_msgs.msg import TurtleBotState
+from std_msgs.msg import Bool
+from asl_tb3_lib.grids import StochOccupancyGrid2D
 
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
+import typing as T
+from scipy.signal import convolve2d
 
-import rclpy
-from rclpy.node import Node
-from rclpy.time import Time
+class Frontier_Explorer(Node):
+    def __init__(self):
+        super().__init__("Explorer")
+        self.occupancy: T.Optional[StochOccupancyGrid2D] = None
+        self.nav_success = None
+        self.state = None
+        self.state_flag = 0 
+        self.map_flag = 0
+        self.stop_flag = 0 # 0 means no stop sign detected
+        self.start_explore_flag = 0
+        self.prev_time = 0
+        self.current_time = 0
+        self.declare_parameter("active", True)
 
-from asl_tb3_lib.navigation import StochOccupancyGrid2D
-from asl_tb3_msgs.msg import TurtleBotState
-from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Bool
+        self.state_sub = self.create_subscription(TurtleBotState, "/state", self.state_callback, 10)
+        self.map_sub = self.create_subscription(OccupancyGrid, "/map", self.map_callback, 10)
+        self.nav_success_sub = self.create_subscription(Bool, "/nav_success", self.nav_success_cb, 10)
+        self.cmd_nav_pub = self.create_publisher(TurtleBotState, "/cmd_nav", 10)
+        self.detector_sub = self.create_subscription(Bool, "/detector_bool", self.detector_cb, 10)
+    
+        
+    def explore(self):
+        """ returns potential states to explore
+        Args:
+            occupancy (StochasticOccupancyGrid2D): Represents the known, unknown, occupied, and unoccupied states. See class in first section of notebook.
 
+        Returns:
+            frontier_states (np.ndarray): state-vectors in (x, y) coordinates of potential states to explore. Shape is (N, 2), where N is the number of possible states to explore.
+        """
+        print("Running Explore\n")
+        window_size = 13    # defines the window side-length for neighborhood of cells to consider for heuristics
+        current_state = np.array([self.state.x, self.state.y])
+        
+        occupied_mask = np.where(self.occupancy.probs >= 0.5, 1, 0)
+        unknown_mask = np.where(self.occupancy.probs == -1, 1, 0)
+        unoccupied_mask = np.where((self.occupancy.probs >= 0) & (self.occupancy.probs < 0.5), 1, 0)
 
-class FrontierExplorer(Node):
+        kernel = np.ones((window_size, window_size))
+        occupied = convolve2d(occupied_mask, kernel, mode="same", boundary="fill", fillvalue=0)
+        unoccupied = convolve2d(unoccupied_mask, kernel, mode="same", boundary="fill", fillvalue=0)
+        unknown = convolve2d(unknown_mask, kernel, mode="same", boundary="fill", fillvalue=0)
 
-    def __init__(self) -> None:
-        super().__init__("frontier_explorer")
-        self.declare_parameters(
-            "",
-            [
-                ("window_size", 7),
-                ("unknown_ratio_threshold", 0.2),
-                ("free_ratio_threshold", 0.3),
-                ("occupancy_threshold", 50),
-                ("min_goal_distance", 0.35),
-                ("post_nav_delay_sec", 1.0),
-                ("state_topic", "/state"),
-                ("map_topic", "/map"),
-                ("nav_success_topic", "/nav_success"),
-                ("nav_cmd_topic", "/cmd_nav"),
-            ],
+        area = window_size * window_size
+        frontier_mask = np.where(
+            (unknown >= 0.2 * area) & (occupied == 0) & (unoccupied >= 0.3 * area), 1, 0
         )
-
-        self._param = lambda key: self.get_parameter(key).value
-
-        self._current_state: Optional[TurtleBotState] = None
-        self._occupancy: Optional[StochOccupancyGrid2D] = None
-        self._frontier_mask: Optional[np.ndarray] = None
-        self._awaiting_nav: bool = False
-        self._last_goal_time: Optional[Time] = None
-        self._last_nav_complete: Optional[Time] = None
-        self._active_goal_grid: Optional[Tuple[int, int]] = None
-        self._reported_completion: bool = False
-        self._frontier_blacklist: set[Tuple[int, int]] = set()
-
-        self._nav_pub = self.create_publisher(
-            TurtleBotState,
-            self._param("nav_cmd_topic"),
-            10,
-        )
-        self._state_sub = self.create_subscription(
-            TurtleBotState,
-            self._param("state_topic"),
-            self._state_callback,
-            10,
-        )
-        self._map_sub = self.create_subscription(
-            OccupancyGrid,
-            self._param("map_topic"),
-            self._map_callback,
-            1,
-        )
-        self._nav_success_sub = self.create_subscription(
-            Bool,
-            self._param("nav_success_topic"),
-            self._nav_status_callback,
-            10,
-        )
-        self.create_timer(0.5, self._timer_callback)
-
-    def _state_callback(self, msg: TurtleBotState) -> None:
-        self._current_state = msg
-        self.try_dispatch_goal()
-
-    def _map_callback(self, msg: OccupancyGrid) -> None:
-        map_data = np.asarray(msg.data, dtype=float)
-        size_xy = np.array([msg.info.width, msg.info.height], dtype=int)
-        origin_xy = np.array([msg.info.origin.position.x, msg.info.origin.position.y], dtype=float)
-        window = self._sanitized_window_size()
-
-        try:
-            self._occupancy = StochOccupancyGrid2D(
-                msg.info.resolution,
-                size_xy,
-                origin_xy,
-                window,
-                map_data,
-            )
-        except ValueError as exc:
-            self.get_logger().warn(f"Failed to build occupancy grid: {exc}")
-            self._frontier_mask = None
+        frontier_states = np.transpose(np.nonzero(np.transpose(frontier_mask)))
+        frontier_states = self.occupancy.grid2state(frontier_states)
+        
+        if len(frontier_states) == 0:
+            print("Finished exploring")
             return
 
-        self._frontier_mask = self._compute_frontiers(self._occupancy)
-        self._apply_blacklist()
-        self._reported_completion = False
-        self.try_dispatch_goal()
+        frontier_state  = np.argmin(np.linalg.norm(frontier_states-current_state,axis=1))
+        frontier_state = frontier_states[frontier_state,:]
 
-    def _nav_status_callback(self, msg: Bool) -> None:
-        if not self._awaiting_nav:
-            return
-        self.get_logger().info(
-            f"Navigation {'succeeded' if msg.data else 'failed'}; computing next frontier target"
+       
+        msg = TurtleBotState()
+        msg.x, msg.y = frontier_state
+        self.cmd_nav_pub.publish(msg)
+		
+
+    
+    def nav_success_cb(self, msg: Bool) -> None:
+        """ Callback triggered when nav_success is updated
+
+        Args:
+            msg (Bool): updated nav_success message
+        """
+        # current_time = self.get_clock().now().nanoseconds/1e9
+        if self.active: 
+            self.explore()
+        # else:           
+        #     if (current_time-self.prev_time)<=5:
+        #         pass
+        #     else:
+        #         self.explore()
+        #         self.prev_time = 0
+        #         self.set_parameters([rclpy.Parameter("active",value = True)])
+
+        # self.explore()       
+        print("i got a message")
+        self.nav_success = msg
+
+    def state_callback(self, msg: TurtleBotState) -> None:
+        """ Callback triggered when nav_success is updated
+
+        Args:
+            msg (Bool): updated nav_success message
+        """
+        self.state_flag = 1
+        self.state=msg
+
+    def map_callback(self, msg: OccupancyGrid) -> None:
+        """ Callback triggered when the map is updated
+
+        Args:
+            msg (OccupancyGrid): updated map message
+        """
+        print("Obtained Map")
+        if self.occupancy is None:
+            self.map_flag=1
+        self.occupancy = StochOccupancyGrid2D(
+            resolution=msg.info.resolution,
+            size_xy=np.array([msg.info.width, msg.info.height]),
+            origin_xy=np.array([msg.info.origin.position.x, msg.info.origin.position.y]),
+            window_size=9,
+            probs=msg.data,
         )
-        if self._active_goal_grid is not None:
-            (self._frontier_blacklist.add if not msg.data else self._frontier_blacklist.discard)(
-                self._active_goal_grid
-            )
-            if self._frontier_mask is not None:
-                self._frontier_mask[self._active_goal_grid] = False
-        self._awaiting_nav = False
-        self._active_goal_grid = None
-        self._last_nav_complete = self.get_clock().now()
-        self.try_dispatch_goal()
+        if self.map_flag==1 and self.state_flag==1:
+            print("Exploring")
+            self.explore()
+            self.map_flag=0
 
-    def _timer_callback(self) -> None:
-        self.try_dispatch_goal()
+    @property  
+    def active(self)-> bool:
+        return self.get_parameter("active").value
+    
+         
+    def detector_cb(self, msg:Bool):
+        if msg.data and (self.stop_flag == 0):
+            self.set_parameters([rclpy.Parameter("active",value = False)])
+            if self.prev_time == 0: # guards in case another stop sign is detected
+                self.prev_time = self.get_clock().now().nanoseconds/1e9
+            self.stop_sign_wait()# call function to deal with stop sign detection
+        elif (self.current_time - self.prev_time) <= 13:
+            self.stop_sign_wait()
 
-    def _sanitized_window_size(self) -> int:
-        window = int(self._param("window_size"))
-        window = max(3, window)
-        if window % 2 == 0:
-            window += 1
-        return window
+    def stop_sign_wait(self):
+        # this if check may be redundant
+        # if self.active: # if stop sign has been detected and robot has not been stopped
+        #     self.active = self.set_parameters([rclpy.Parameter("active",value = False)])
+        #     msg = self.state
+        #     self.cmd_nav_pub.publish(self.state)
+            
+        # else: # if it's not detected
+        self.current_time = self.get_clock().now().nanoseconds/1e9
+        if (self.current_time - self.prev_time) <= 5:
+            # msg = self.state
+            self.cmd_nav_pub.publish(self.state)
+            print('stop sign seen within 5 seconds')
+        elif (self.current_time - self.prev_time) <= 10: # some buffer time in between
+            if (self.start_explore_flag == 0):
+                self.explore()
+                self.start_explore_flag = 1
+            self.set_parameters([rclpy.Parameter("active",value = True)])
+            self.stop_flag = 1 # stop sign has been detected and being dealt with (end process)
+            print('stop sign seen within 10 seconds')
 
-    def _compute_frontiers(self, occupancy: StochOccupancyGrid2D) -> np.ndarray:
-        grid = occupancy.probs
-        if grid.size == 0:
-            return np.zeros_like(grid, dtype=bool)
-        window = self._sanitized_window_size()
-        if min(grid.shape) < window:
-            self.get_logger().warn(
-                f"Occupancy grid ({grid.shape}) smaller than window size {window}; skipping frontier detection",
-                throttle_duration_sec=5.0,
-            )
-            return np.zeros_like(grid, dtype=bool)
+        else:
+            # self.explore()
+            self.stop_flag = 0
+            self.prev_time = 0
+        
+        self.start_explore_flag = 0
+        
+            
+        # return msg
 
-        occ_thresh = float(self._param("occupancy_threshold"))
-        unknown_mask = grid < 0
-        occupied_mask = grid >= occ_thresh
-        free_mask = (~unknown_mask) & (~occupied_mask)
+    
+            
 
-        unknown_ratio = self._window_sum(unknown_mask, window) / float(window * window)
-        occupied_count = self._window_sum(occupied_mask, window).astype(int)
-        free_ratio = self._window_sum(free_mask, window) / float(window * window)
-
-        candidates = free_mask
-        candidates &= unknown_ratio >= float(self._param("unknown_ratio_threshold"))
-        candidates &= occupied_count == 0
-        candidates &= free_ratio >= float(self._param("free_ratio_threshold"))
-
-        return candidates
-
-    @staticmethod
-    def _window_sum(mask: np.ndarray, window: int) -> np.ndarray:
-        if mask.shape[0] < window or mask.shape[1] < window:
-            return np.zeros_like(mask, dtype=float)
-        pad = window // 2
-        padded = np.pad(mask.astype(float), pad_width=pad, mode="constant", constant_values=0)
-        windows = sliding_window_view(padded, (window, window))
-        return windows.sum(axis=(-2, -1))
-
-    def try_dispatch_goal(self) -> None:
-        if (
-            self._awaiting_nav
-            or self._current_state is None
-            or self._occupancy is None
-            or self._frontier_mask is None
-        ):
-            return
-        if not np.any(self._frontier_mask):
-            if not self._reported_completion:
-                self.get_logger().info("No remaining frontier cells; exploration complete")
-                self._reported_completion = True
-            return
-
-        now = self.get_clock().now()
-        delay = float(self._param("post_nav_delay_sec"))
-        if self._last_nav_complete is not None:
-            elapsed = (now - self._last_nav_complete).nanoseconds / 1e9
-            if elapsed < delay:
-                return
-
-        selection = self._select_next_goal()
-        if selection is None:
-            return
-        goal, grid_idx = selection
-        self._nav_pub.publish(goal)
-        self._awaiting_nav = True
-        self._active_goal_grid = grid_idx
-        self._last_goal_time = now
-        self.get_logger().info(
-            f"Commanding frontier goal at ({goal.x:.2f}, {goal.y:.2f}) heading {goal.theta:.2f} rad",
-        )
-
-    def _select_next_goal(self) -> Optional[Tuple[TurtleBotState, Tuple[int, int]]]:
-        assert self._frontier_mask is not None
-        frontier_indices = np.argwhere(self._frontier_mask)
-        if frontier_indices.size == 0 or self._current_state is None or self._occupancy is None:
-            return None
-
-        state_xy = np.array([self._current_state.x, self._current_state.y], dtype=float)
-        grid_xy = frontier_indices[:, [1, 0]].astype(float)
-        world_xy = grid_xy * self._occupancy.resolution + self._occupancy.origin_xy
-
-        deltas = world_xy - state_xy
-        distances = np.linalg.norm(deltas, axis=1)
-        if distances.size == 0:
-            return None
-
-        min_idx = int(np.argmin(distances))
-        min_distance = float(distances[min_idx])
-        min_goal_distance = float(self._param("min_goal_distance"))
-        if min_distance < min_goal_distance:
-            cell = tuple(frontier_indices[min_idx])
-            self._frontier_mask[cell] = False
-            self._frontier_blacklist.add(cell)
-            return None
-
-        heading = math.atan2(deltas[min_idx, 1], deltas[min_idx, 0])
-        goal = TurtleBotState()
-        goal.x = float(world_xy[min_idx, 0])
-        goal.y = float(world_xy[min_idx, 1])
-        goal.theta = float(heading)
-        return goal, tuple(frontier_indices[min_idx])
-
-    def _apply_blacklist(self) -> None:
-        if self._frontier_mask is None or not self._frontier_blacklist:
-            return
-        h, w = self._frontier_mask.shape
-        for cell in list(self._frontier_blacklist):
-            r, c = cell
-            if 0 <= r < h and 0 <= c < w:
-                self._frontier_mask[r, c] = False
-            else:
-                self._frontier_blacklist.discard(cell)
-
-
-def main(args: Optional[Sequence[str]] = None) -> None:
-    rclpy.init(args=args)
-    node = FrontierExplorer()
+def main():
+    rclpy.init(args=None)
+    print("main")
+    node = Frontier_Explorer()
     rclpy.spin(node)
     rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
