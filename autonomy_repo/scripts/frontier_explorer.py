@@ -8,7 +8,7 @@ from asl_tb3_lib.grids import StochOccupancyGrid2D
 
 import numpy as np
 import typing as T
-from scipy.signal import convolve2d
+"""Frontier exploration node for TurtleBot3."""
 
 class Frontier_Explorer(Node):
     def __init__(self):
@@ -50,10 +50,27 @@ class Frontier_Explorer(Node):
         unknown_mask = np.where(self.occupancy.probs == -1, 1, 0)
         unoccupied_mask = np.where((self.occupancy.probs >= 0) & (self.occupancy.probs < 0.5), 1, 0)
 
-        kernel = np.ones((window_size, window_size))
-        occupied = convolve2d(occupied_mask, kernel, mode="same", boundary="fill", fillvalue=0)
-        unoccupied = convolve2d(unoccupied_mask, kernel, mode="same", boundary="fill", fillvalue=0)
-        unknown = convolve2d(unknown_mask, kernel, mode="same", boundary="fill", fillvalue=0)
+        def box_sum(mask: np.ndarray) -> np.ndarray:
+            # Fast box filter via summed-area table to avoid SciPy dependency
+            half = window_size // 2
+            padded = np.pad(mask, ((half, half), (half, half)), mode="constant")
+            integral = padded.cumsum(axis=0).cumsum(axis=1)
+            h, w = mask.shape
+            k = window_size
+            # Compute sum over k x k neighborhoods centered on each original cell
+            y2 = np.arange(k, h + k)
+            x2 = np.arange(k, w + k)
+            y1 = y2 - k
+            x1 = x2 - k
+            A = integral[np.ix_(y1, x1)]
+            B = integral[np.ix_(y1, x2)]
+            C = integral[np.ix_(y2, x1)]
+            D = integral[np.ix_(y2, x2)]
+            return D - B - C + A
+
+        occupied = box_sum(occupied_mask)
+        unoccupied = box_sum(unoccupied_mask)
+        unknown = box_sum(unknown_mask)
 
         area = window_size * window_size
         frontier_mask = np.where(
